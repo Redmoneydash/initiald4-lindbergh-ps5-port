@@ -1,0 +1,100 @@
+/*
+ * overrides.c - replacing a guest function with a host one.
+ *
+ * Not everything a Lindbergh game calls its libraries for arrives through the
+ * PLT. libXxf86vm is statically linked INTO this binary, so XF86VidMode* are
+ * lifted code, not imports - and the lifted code talks the X protocol down a
+ * socket that does not exist here.
+ *
+ * Every guest call already goes through dispatch(), so an override is just a
+ * lookup there: the address of a guest function, and a host body to run
+ * instead. The stack convention is the one dispatch already uses for an
+ * indirect PLT hit - on entry esp points at the return address with arguments
+ * above it, so consuming the return slot lines them up for a handler and
+ * returning hands control back exactly as the guest's own `ret` would.
+ *
+ * The check is on the hot path, so it is a range test first: overrides cluster
+ * in one small span of the image, and two comparisons reject every other
+ * address before any scanning happens.
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "lindbergh_rt.h"
+
+extern void klogf(const char*, ...);
+#include "recomp_symbols.h"
+
+#define MAX_OVERRIDES 256
+
+typedef struct { uint32_t va; HleHandler fn; const char *name; } Override;
+
+static Override g_ov[MAX_OVERRIDES];
+static int      g_ov_n;
+static uint32_t g_ov_lo = 0xFFFFFFFFu, g_ov_hi;
+
+uint32_t guest_symbol(const char *name)
+{
+#define SYM(n, a) if (strcmp(name, n) == 0) return a;
+    GUEST_SYMBOLS(SYM)
+#undef SYM
+    return 0;
+}
+
+int guest_override(const char *name, HleHandler fn)
+{
+    uint32_t va = guest_symbol(name);
+    if (!va) return 0;                       /* this game does not have it */
+    if (g_ov_n >= MAX_OVERRIDES) {
+        { klogf("[override] table full: %s\n", name); }
+        return 0;
+    }
+    g_ov[g_ov_n].va = va;
+    g_ov[g_ov_n].fn = fn;
+    g_ov[g_ov_n].name = name;
+    g_ov_n++;
+    if (va < g_ov_lo) g_ov_lo = va;
+    if (va > g_ov_hi) g_ov_hi = va;
+    return 1;
+}
+
+int guest_override_va(uint32_t va, HleHandler fn, const char *name)
+{
+    if (g_ov_n >= MAX_OVERRIDES) {
+        klogf("[override] table full: %s\n", name);
+        return 0;
+    }
+    g_ov[g_ov_n].va = va;
+    g_ov[g_ov_n].fn = fn;
+    g_ov[g_ov_n].name = name;
+    g_ov_n++;
+    if (va < g_ov_lo) g_ov_lo = va;
+    if (va > g_ov_hi) g_ov_hi = va;
+    return 1;
+}
+
+HleHandler guest_find_override(uint32_t va)
+{
+    /* Diag: seqVSMatchingSelect calls (0x82D9E68 onTick, 0x82D99EE
+     * tickInitMatching) should always hit the override — log misses. */
+    if (va == 0x08570EE0u) {
+        for (int i = 0; i < g_ov_n; i++)
+            if (g_ov[i].va == va) { klogf("[ov] addps_cc hit\n"); return g_ov[i].fn; }
+        klogf("[ov] addps_cc MISS n=%d lo=%#x hi=%#x\n", g_ov_n, g_ov_lo, g_ov_hi);
+        return NULL;
+    }
+    if (va == 0x082D9E68u || va == 0x082D99EEu) {
+        for (int i = 0; i < g_ov_n; i++)
+            if (g_ov[i].va == va) { klogf("[ov] hit %#x -> %s\n", va, g_ov[i].name); return g_ov[i].fn; }
+        klogf("[ov] MISS %#x n=%d lo=%x hi=%x\n", va, g_ov_n, g_ov_lo, g_ov_hi);
+        return NULL;
+    }
+    if (va < g_ov_lo || va > g_ov_hi) return NULL;
+    for (int i = 0; i < g_ov_n; i++)
+        if (g_ov[i].va == va) return g_ov[i].fn;
+    return NULL;
+}
+
+uint32_t guest_override_lo(void) { return g_ov_lo; }
+uint32_t guest_override_hi(void) { return g_ov_hi; }
