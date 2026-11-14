@@ -1,0 +1,228 @@
+/*
+ * lindbergh_rt.h - runtime for statically recompiled Lindbergh games.
+ *
+ * The CPU model is pcrecomp's (pcrecomp/runtime/recomp32_cpu/cpu.h): an
+ * explicit `CPU *c` threaded through every lifted function, flat memory where
+ * a register holds a real 32-bit host address. That means the host must be a
+ * 32-bit build - the game's segments are mapped at the virtual addresses it
+ * was linked for, and on Linux/i386 those are down at 0x08048000.
+ *
+ * What this header adds is the Lindbergh side of the boundary: a Linux/i386
+ * process to be, a kernel to call, and a set of shared libraries the board
+ * provided that we have to provide instead.
+ */
+#ifndef LINDBERGH_RT_H
+#define LINDBERGH_RT_H
+
+/* Generated code calls abort() wherever an instruction did not lift, so the
+ * declaration has to travel with the header the generated code includes. */
+#include <stdint.h>
+#include <stdlib.h>
+
+/* cpu.h defaults RECOMP_TODO to a bare abort(), and invites a consumer to
+ * define its own first. Take the invitation: an abort() here raises
+ * __fastfail past every handler with no message, so an unimplemented
+ * instruction is indistinguishable from memory corruption - which cost four
+ * wrong diagnoses before this existed. */
+void lindbergh_todo(uint32_t va, const char *text);
+#define RECOMP_TODO(va, text) lindbergh_todo((va), (text))
+
+/* /dev/klog's reader wedges EBUSY once a suspended process dies holding it.
+ * All our log traffic goes through sceKernelDebugOutText — alias it to
+ * id4_dbg, which writes fd 2 (the dup2'd log file in /data/tmp) so the same
+ * bytes reach storage regardless of the klog reader's state. */
+int id4_dbg(int ch, const char *s);
+int id4_dbgf(const char *fmt, ...);
+#define sceKernelDebugOutText id4_dbg
+/* fd2 is /dev/null in a managed app — every fprintf(stderr,...) in the
+ * runtime would be silently dropped; route it through the UDP+klog sink. */
+#define fprintf(f, ...) id4_dbgf(__VA_ARGS__)
+
+#include "cpu.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---- guest process ---- */
+
+/* Map an ELF's PT_LOADs at their original virtual addresses and build the
+ * initial stack (argc/argv/envp/auxv) the way the kernel does, so the game's
+ * _start finds what it expects. Returns 0, or -1 with the reason on stderr. */
+int  guest_load(const char *elf_path, int argc, char **argv);
+
+/* Entry point VA from the ELF header, valid after guest_load. */
+uint32_t guest_entry(void);
+
+/* Initialise a CPU to enter the guest: esp at the built stack, everything
+ * else zero, exactly as Linux hands a fresh process to _start. */
+void guest_init_cpu(CPU *c);
+
+/* Guest break, for the brk/sbrk syscalls. */
+uint32_t guest_brk(uint32_t newbrk);
+
+/* ---- kernel ---- */
+
+/* `int 0x80` and the vDSO's sysenter both land here. Number in eax, arguments
+ * in ebx/ecx/edx/esi/edi/ebp, result back into eax (negative errno on
+ * failure), per the Linux i386 calling convention. */
+void linux_syscall(CPU *c);
+
+/* ---- shared libraries ---- */
+
+/* Every PLT import in the game gets an HLE_* id; recomp_imports.h is
+ * generated from the ELF and lists them. */
+#include "recomp_imports.h"
+
+#define HLE_ENUM(id, name) id,
+typedef enum { HLE_IMPORTS(HLE_ENUM) HLE_COUNT } HleId;
+#undef HLE_ENUM
+
+/* A library function's body. Reads its arguments off the guest stack and
+ * leaves the return value in eax, the cdecl the ELF was built for. */
+typedef void (*HleHandler)(CPU *c);
+
+/* One slot per import. A game project fills in the ones it needs; the toolkit
+ * ships the ones every title shares. A slot left null aborts naming itself,
+ * which is the to-do list. */
+extern HleHandler g_hle_handlers[];
+
+void hle_call(CPU *c, HleId id);
+
+/* The PLT stub address for a named import, or 0. What glXGetProcAddressARB
+ * hands back, so the guest's indirect call through it routes like any other. */
+uint32_t hle_plt_address(const char *name);
+
+/* Give a named import a body. Binding by name and not by HLE_* id is what
+ * keeps a handler file title-agnostic: HLE_memcpy only exists as an enumerator
+ * if *this* game imports memcpy, so a file that said `g_hle_handlers[HLE_memcpy]`
+ * would fail to compile against a game that does not. Returns 0 when the game
+ * does not import that name, which is not an error - most do not import most
+ * of them. */
+int hle_bind(const char *name, HleHandler fn);
+
+/* Bind every handler the toolkit ships. A game project calls this once, then
+ * binds its own on top. */
+void hle_register_all(void);
+void hle_register_libc(void);
+void hle_register_libc2(void);
+void hle_register_cg(void);
+void hle_register_io(void);
+void hle_register_libc3(void);
+void hle_register_pthread(void);
+void hle_register_window(void);
+
+/* ---- the guest side of a call ----
+ *
+ * The lifter turns `call <plt stub>` into hle_call() and pushes no return
+ * address, so on entry esp points straight at argument 0. cdecl, so the
+ * handler must not move esp - the caller's own `add esp, N` does that.
+ */
+#define A32(n)   rd32(c->esp + 4u * (unsigned)(n))
+#define APTR(n)  ((void *)(uintptr_t)A32(n))
+#define ASTR(n)  ((char *)(uintptr_t)A32(n))
+#define AI32(n)  ((int32_t)A32(n))
+#define RET(v)   (c->eax = (uint32_t)(uintptr_t)(v))
+
+/* A function returning float or double returns it in st(0) on i386 SysV, not
+ * in an XMM register - the caller does `fstp` to take it. Every math import
+ * below goes back this way. */
+#define RETF(v)  fpush(c, (double)(v))
+
+/* Name for an id, for diagnostics. */
+const char *hle_name(HleId id);
+
+/* ---- lifted code ---- */
+
+/* Address -> lifted function. Generated: recomp_funcs_list.h is the X-macro
+ * of every VA that lifted, and recomp_dispatch.c turns it into a table. */
+void dispatch(CPU *c, uint32_t va);
+void dispatch_jmp(CPU *c, uint32_t va);
+
+/* Run a guest function from host code and return its eax. Arguments are
+ * pushed cdecl-style and esp is restored afterwards. */
+uint32_t guest_call(CPU *c, uint32_t fn, const uint32_t *args, int nargs);
+
+/* ---- bring-up diagnostics ----
+ * A fault in lifted code tells a debugger nothing useful. These report the
+ * guest machine instead: its registers, and the last 64 addresses dispatch()
+ * sent control to. */
+void guest_install_crash_handler(void);
+void guest_set_current_cpu(CPU *c);
+void guest_report_state(const char *why);
+void guest_trace_dispatch(uint32_t va);
+void guest_backtrace(CPU *c);
+
+/* ---- guest function overrides ----
+ * Replace a lifted function with a host one, by symbol name. For library code
+ * that was statically linked into the game and so never passes through the
+ * PLT - libXxf86vm being the reason this exists. */
+uint32_t   guest_symbol(const char *name);
+int        guest_override(const char *name, HleHandler fn);
+int        guest_override_va(uint32_t va, HleHandler fn, const char *name);
+HleHandler guest_find_override(uint32_t va);
+void       hle_register_vidmode(void);
+void       hle_register_matrix(void);
+void       hle_register_console(void);
+void       hle_register_sega(void);
+void       hle_register_glut(void);
+void       hle_register_cxx(void);
+void       hle_register_dir(void);
+void       hle_register_scan(void);
+
+/* ---- host input ----
+ *
+ * One queue, filled by the window procedure and drained by whoever drives the
+ * game loop. A light gun is a mouse: the cabinet's gun reports where on the
+ * screen it points and whether the trigger is down, which is what a pointer
+ * and a button already are. */
+enum { HOST_IN_MOTION = 1, HOST_IN_MOUSE, HOST_IN_KEY, HOST_IN_KEYUP,
+       HOST_IN_SPECIAL };
+
+typedef struct { int kind, a, b, c, d; } HostInput;
+
+int        hle_stub_call(CPU *c, uint32_t va);
+/* The cabinet's switches and its gun, as a desktop can supply them. */
+enum { CAB_P1_START = 1u << 0, CAB_P2_START = 1u << 1,
+       CAB_TEST     = 1u << 2, CAB_SERVICE  = 1u << 3,
+       CAB_P1_TRIGGER = 1u << 4, CAB_P1_RELOAD = 1u << 5 };
+
+typedef struct {
+    unsigned coins[2];        /* only ever counts up, like a coin mech */
+    unsigned buttons;
+    int gun_x, gun_y;
+    int steer, accel, brake;  /* driving cabinet: JVS analog 0/1/2, 0..65535 */
+    int screen_w, screen_h;
+} CabinetInput;
+
+void       guest_install_thread_handlers(void);
+void       host_cabinet_input(CabinetInput *out);
+int        host_input_pop(HostInput *out);
+void       host_mouse_state(int *x, int *y, int *buttons);
+
+/* The host window and its GL context, shared by the GLX and GLUT seams. */
+void       host_window_hint(int w, int h);
+int        host_window_open(const char *title);
+int        host_gl_context(void);
+void       host_pump(void);
+void       host_swap(void);
+void       hle_register_gl(void);
+
+/* A callable address for a GL entry point the game asks for by name but does
+ * not import. gl_token_call routes one; dispatch() consults it. */
+uint32_t   gl_token_for(const char *name);
+int        gl_token_call(CPU *c, uint32_t va);
+int        gl_token_count(void);
+void       lindbergh_window_size(int *w, int *h);
+
+/* Emitted by the lifter wherever an instruction did not translate. Reports and
+ * exits - never returns, because the guest state after a skipped instruction
+ * is wrong in a way that shows up much later as something else. */
+
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* LINDBERGH_RT_H */
+
+void klogf(const char *fmt, ...);
