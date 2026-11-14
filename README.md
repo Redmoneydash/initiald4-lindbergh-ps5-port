@@ -16,7 +16,12 @@ layer and runtime patches, no game code or assets (same policy as upstream).
 - **Linux desktop**: windowed EGL/GL build — same runtime, keyboard input,
   working audio via ALSA (`pulse`/`pipewire`/HDMI fallback). Used as the
   bring-up/debug target since it reproduces PS5 behavior 1:1.
-- **Not yet**: the 3D scene pass. Scene geometry submits correctly
+- **Windows desktop** (`windows/`): native x86/MSVC build with WGL. Runs the
+  attract loop **including the 3D scene** - story cutscenes, car select and
+  races render fully. The scene-pass problem below turned out to be the
+  post-process shaders, not the FBOs; see [windows/README.md](windows/README.md)
+  for the cause and fix (needs the NVIDIA Cg Toolkit 3.1 installed).
+- **Not yet** (PS5/Linux): the 3D scene pass. Scene geometry submits correctly
   (`glDrawRangeElements`, VBOs, real ARB vertex programs with matrices landing
   in `program.env`), but content renders into FBOs that read back flat —
   an FBO→composite path issue still under investigation. `LINDBERGH_NO_FBO=1`
@@ -36,6 +41,9 @@ layer and runtime patches, no game code or assets (same policy as upstream).
 - `orbis/` — the PS5 platform layer: CRT startup, emutls, heap, pthreads,
   `libsegaapi` mixer on `sceAudioOut`, diagnostics (fault.log/startup.log),
   Makefile for the managed app target.
+- `windows/` — native Windows build: a self-contained copy of the runtime
+  with the Windows paths, MSVC shims, `build.bat`, and the shader/render
+  fixes that make the 3D scene draw. See its README.
 
 ## Useful knobs (runtime env)
 
