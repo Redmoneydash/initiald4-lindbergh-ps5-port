@@ -1,4 +1,4 @@
-# Initial D Arcade Stage 4 — native PS5 + Linux port (WIP)
+# Initial D Arcade Stage 4 — native PS5 + Linux port + Windows (WIP)
 
 A work-in-progress port of a Sega Lindbergh x86 arcade title to run **natively
 as a managed PS5 application** — no external compatibility layer — built on top
